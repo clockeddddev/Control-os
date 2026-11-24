@@ -1,17 +1,11 @@
 -- ==========================================
--- BASE CONTROL OS 98 - CC:DirectGPU Edition
+-- BASE CONTROL OS 98 (Standard Monitor + Bliss Wallpaper)
 -- ==========================================
 peripheral.find("modem", rednet.open)
-local gpu = peripheral.find("directgpu")
-assert(gpu, "No DirectGPU block attached!")
-
-gpu.clearAllDisplays()
-local disp = gpu.autoDetectAndCreateDisplay()
-assert(disp, "DirectGPU could not find a monitor!")
-
-local info = gpu.getDisplayInfo(disp)
-local W, H = info.pixelWidth, info.pixelHeight
-local FONT = "Arial"
+local mon = peripheral.find("monitor")
+assert(mon, "No monitor attached!")
+mon.setTextScale(0.5)
+term.redirect(mon)
 
 local STORAGE_PROTOCOL = "base_storage_sync"
 
@@ -39,19 +33,16 @@ local liveTotals = {}
 local liveNames = {}
 
 local btns = {
-  { name = "Base Lights", state = "OFF", msg = "lights" },
-  { name = "Blast Door",  state = "OFF", msg = "door"   },
-  { name = "Create Farm", state = "OFF", msg = "farm"   },
-  { name = "Base Alarm",  state = "OFF", msg = "alarm"  }
+  { name = "LIGHTS", state = "OFF", msg = "lights" },
+  { name = "DOOR  ", state = "OFF", msg = "door"   },
+  { name = "FARM  ", state = "OFF", msg = "farm"   },
+  { name = "ALARM ", state = "OFF", msg = "alarm"  }
 }
 
 local lastCounts = {}
 local ratesPerMin = {}
 local lastScanTime = os.epoch("utc") / 1000
 
--- ==========================================
--- STORAGE SYNC HANDLER
--- ==========================================
 local function processIncomingStorage(data)
   if type(data) ~= "table" or not data.totals then return end
   liveTotals = data.totals
@@ -76,322 +67,352 @@ local function processIncomingStorage(data)
 end
 
 -- ==========================================
--- WIN98 PIXEL DRAWING PRIMITIVES
+-- GRASSY FIELDS WALLPAPER GENERATOR
 -- ==========================================
-local function drawBevelBox(x, y, w, h, raised, fillR, fillG, fillB)
-  local r, g, b = fillR or 192, fillG or 192, fillB or 192
-  gpu.fillRect(disp, x, y, w, h, r, g, b)
+local function getWallpaperColor(x, y, w, h)
+  local nx = x / w
+  local ny = y / h
 
-  if raised then
-    -- Outer top/left white, bottom/right black
-    gpu.drawLine(disp, x, y, x + w - 1, y, 255, 255, 255)
-    gpu.drawLine(disp, x, y, x, y + h - 1, 255, 255, 255)
-    gpu.drawLine(disp, x, y + h - 1, x + w - 1, y + h - 1, 0, 0, 0)
-    gpu.drawLine(disp, x + w - 1, y, x + w - 1, y + h - 1, 0, 0, 0)
-    -- Inner bottom/right dark gray
-    gpu.drawLine(disp, x + 1, y + h - 2, x + w - 2, y + h - 2, 128, 128, 128)
-    gpu.drawLine(disp, x + w - 2, y + 1, x + w - 2, y + h - 2, 128, 128, 128)
-  else
-    -- Sunken: top/left dark gray + black, bottom/right white
-    gpu.drawLine(disp, x, y, x + w - 1, y, 128, 128, 128)
-    gpu.drawLine(disp, x, y, x, y + h - 1, 128, 128, 128)
-    gpu.drawLine(disp, x + 1, y + 1, x + w - 2, y + 1, 0, 0, 0)
-    gpu.drawLine(disp, x + 1, y + 1, x + 1, y + h - 2, 0, 0, 0)
-    gpu.drawLine(disp, x, y + h - 1, x + w - 1, y + h - 1, 255, 255, 255)
-    gpu.drawLine(disp, x + w - 1, y, x + w - 1, y + h - 1, 255, 255, 255)
+  -- Rolling green hills (foreground & background ridges)
+  local frontHill = 0.56 + 0.08 * math.sin(nx * 4.5 + 0.5)
+  local backHill  = 0.52 + 0.06 * math.cos(nx * 5.0 - 0.8)
+
+  if ny >= frontHill then
+    return colors.lime
+  elseif ny >= backHill then
+    return colors.green
   end
+
+  -- Fluffy white clouds in the sky
+  local c1 = ((nx - 0.62) / 0.14)^2 + ((ny - 0.22) / 0.07)^2
+  local c2 = ((nx - 0.72) / 0.11)^2 + ((ny - 0.25) / 0.06)^2
+  local c3 = ((nx - 0.28) / 0.10)^2 + ((ny - 0.16) / 0.05)^2
+  if c1 <= 1.0 or c2 <= 1.0 or c3 <= 1.0 then
+    return colors.white
+  end
+
+  -- Classic blue sky
+  return colors.lightBlue
 end
 
--- Classic Win98 Blue-to-LightBlue Gradient Bar
-local function drawTitleGradient(x, y, w, h)
-  local steps = 24
-  local sliceW = math.ceil(w / steps)
-  for i = 0, steps - 1 do
-    local t = i / (steps - 1)
-    local r = math.floor(0   + t * 16)
-    local g = math.floor(0   + t * 132)
-    local b = math.floor(128 + t * 80)
-    local sx = x + i * sliceW
-    local sw = math.min(sliceW, (x + w) - sx)
-    if sw > 0 then
-      gpu.fillRect(disp, sx, y, sw, h, r, g, b)
+local function drawWallpaper()
+  local w, h = term.getSize()
+  for y = 1, h - 1 do
+    for x = 1, w do
+      term.setCursorPos(x, y)
+      term.setBackgroundColor(getWallpaperColor(x, y, w, h))
+      term.write(" ")
     end
   end
 end
 
--- Mini 4-color Windows Flag for Start Button
-local function drawWinLogo(x, y)
-  gpu.fillRect(disp, x,     y,     5, 5, 255, 60,  30)  -- Red
-  gpu.fillRect(disp, x + 6, y,     5, 5, 60,  200, 60)  -- Green
-  gpu.fillRect(disp, x,     y + 6, 5, 5, 40,  120, 255) -- Blue
-  gpu.fillRect(disp, x + 6, y + 6, 5, 5, 255, 210, 30)  -- Yellow
+-- ==========================================
+-- WIN98 UI DRAWING PRIMITIVES
+-- ==========================================
+local function fillRect(x1, y1, x2, y2, bg)
+  if x2 < x1 or y2 < y1 then return end
+  term.setBackgroundColor(bg)
+  for y = y1, y2 do
+    term.setCursorPos(x1, y)
+    term.write(string.rep(" ", x2 - x1 + 1))
+  end
 end
 
--- ==========================================
--- LAYOUT & BOUNDS HELPERS
--- ==========================================
-local TASKBAR_H = 28
-
-local function getWindowRect()
-  local pad = math.max(12, math.floor(W * 0.04))
-  local wx = pad
-  local wy = pad
-  local ww = W - (pad * 2)
-  local wh = H - TASKBAR_H - (pad * 2)
-  return wx, wy, ww, wh
+local function drawRaisedPanel(x1, y1, x2, y2, bg)
+  fillRect(x1, y1, x2, y2, bg or colors.lightGray)
+  term.setBackgroundColor(colors.white)
+  term.setCursorPos(x1, y1)
+  term.write(string.rep(" ", x2 - x1))
+  for y = y1, y2 - 1 do
+    term.setCursorPos(x1, y)
+    term.write(" ")
+  end
+  term.setBackgroundColor(colors.gray)
+  term.setCursorPos(x1, y2)
+  term.write(string.rep(" ", x2 - x1 + 1))
+  for y = y1 + 1, y2 do
+    term.setCursorPos(x2, y)
+    term.write(" ")
+  end
 end
 
-local function getCloseBtnRect()
-  local wx, wy, ww, _ = getWindowRect()
-  return wx + ww - 24, wy + 6, 18, 16
+local function drawSunkenBox(x1, y1, x2, y2, bg)
+  fillRect(x1, y1, x2, y2, bg or colors.white)
+  term.setBackgroundColor(colors.gray)
+  term.setCursorPos(x1, y1)
+  term.write(string.rep(" ", x2 - x1))
+  for y = y1, y2 - 1 do
+    term.setCursorPos(x1, y)
+    term.write(" ")
+  end
+  term.setBackgroundColor(colors.white)
+  term.setCursorPos(x1, y2)
+  term.write(string.rep(" ", x2 - x1 + 1))
+  for y = y1 + 1, y2 do
+    term.setCursorPos(x2, y)
+    term.write(" ")
+  end
 end
 
--- ==========================================
--- WINDOW FRAME
--- ==========================================
+local function getWindowInnerBounds()
+  local w, h = term.getSize()
+  local x1, y1 = 2, 2
+  local x2, y2 = w - 1, h - 2
+  return x1 + 2, y1 + 3, x2 - 2, y2 - 1
+end
+
 local function drawWindow(title)
-  local wx, wy, ww, wh = getWindowRect()
-  drawBevelBox(wx, wy, ww, wh, true, 192, 192, 192)
+  local w, h = term.getSize()
+  local x1, y1 = 2, 2
+  local x2, y2 = w - 1, h - 2
 
-  -- Title Bar
-  local tx, ty, tw, th = wx + 4, wy + 4, ww - 8, 20
-  drawTitleGradient(tx, ty, tw, th)
-  gpu.drawText(disp, title, tx + 6, ty + 4, 255, 255, 255, FONT, 12, "bold")
+  drawRaisedPanel(x1, y1, x2, y2, colors.lightGray)
 
-  -- [X] Close Button
-  local cx, cy, cw, ch = getCloseBtnRect()
-  drawBevelBox(cx, cy, cw, ch, true, 192, 192, 192)
-  gpu.drawLine(disp, cx + 5, cy + 4, cx + cw - 6, cy + ch - 5, 0, 0, 0)
-  gpu.drawLine(disp, cx + cw - 6, cy + 4, cx + 5, cy + ch - 5, 0, 0, 0)
+  term.setCursorPos(x1 + 1, y1 + 1)
+  term.setBackgroundColor(colors.blue)
+  term.setTextColor(colors.white)
+  term.write(string.rep(" ", x2 - x1 - 1))
+  term.setCursorPos(x1 + 2, y1 + 1)
+  term.write(title:sub(1, x2 - x1 - 6))
 
-  -- Return Inner Client Bounds
-  return wx + 8, wy + 28, ww - 16, wh - 36
+  term.setCursorPos(x2 - 3, y1 + 1)
+  term.setBackgroundColor(colors.lightGray)
+  term.setTextColor(colors.black)
+  term.write(" X ")
+
+  return getWindowInnerBounds()
 end
 
 -- ==========================================
--- DESKTOP & PIXEL ICONS
+-- TASKBAR & START MENU
 -- ==========================================
-local desktopIcons = {
-  { id = "control", label = "Control Panel", r = 40,  g = 170, b = 70  },
-  { id = "plant",   label = "Plant Output",  r = 230, g = 130, b = 30  },
-  { id = "storage", label = "Base Storage",  r = 40,  g = 110, b = 220 }
+local startItems = {
+  { id = "control", label = "Control Panel", color = colors.green  },
+  { id = "plant",   label = "Plant Output ", color = colors.orange },
+  { id = "storage", label = "Base Storage ", color = colors.cyan   },
+  { id = "desktop", label = "Show Desktop ", color = colors.blue   }
 }
 
-local function getIconRect(i)
-  return 20, 20 + ((i - 1) * 74), 76, 62
+local function getStartMenuBounds()
+  local _, h = term.getSize()
+  local compact = (h < 14)
+  local step = compact and 1 or 2
+  local top = math.max(1, h - (#startItems * step) - 1)
+  return 1, top, 20, h - 1, step
 end
 
-local function drawPixelIcon(id, x, y)
-  if id == "control" then
-    -- Switch Panel Icon
-    drawBevelBox(x, y, 32, 32, true, 192, 192, 192)
-    gpu.fillRect(disp, x + 5, y + 6,  22, 8, 40, 200, 60)
-    gpu.fillRect(disp, x + 5, y + 18, 22, 8, 210, 50, 50)
-  elseif id == "plant" then
-    -- Factory Chart Icon
-    drawBevelBox(x, y, 32, 32, false, 255, 255, 255)
-    gpu.fillRect(disp, x + 5,  y + 18, 5, 10, 40, 120, 240)
-    gpu.fillRect(disp, x + 13, y + 12, 5, 16, 40, 190, 80)
-    gpu.fillRect(disp, x + 21, y + 6,  5, 22, 240, 140, 30)
-  elseif id == "storage" then
-    -- Create Brass/Vault Crate Icon
-    drawBevelBox(x, y, 32, 32, true, 180, 130, 60)
-    gpu.fillRect(disp, x + 4, y + 4, 24, 24, 215, 165, 80)
-    gpu.drawLine(disp, x + 4, y + 16, x + 27, y + 16, 110, 75, 30)
-    gpu.fillRect(disp, x + 13, y + 13, 6, 6, 90, 90, 100)
+local function drawTaskbar()
+  local w, h = term.getSize()
+  term.setCursorPos(1, h)
+  term.setBackgroundColor(colors.lightGray)
+  term.clearLine()
+
+  term.setCursorPos(1, h)
+  term.setBackgroundColor(startMenuOpen and colors.gray or colors.green)
+  term.setTextColor(colors.white)
+  term.write(" Start ")
+
+  if currentApp ~= "desktop" then
+    local tabNames = {
+      control = "Control Panel",
+      plant   = "Plant Output",
+      storage = "Base Storage"
+    }
+    term.setCursorPos(9, h)
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.white)
+    term.write(" " .. (tabNames[currentApp] or currentApp) .. " ")
   end
+
+  local timeStr = textutils.formatTime(os.time(), false)
+  local trayW = #timeStr + 4
+  term.setCursorPos(w - trayW + 1, h)
+  term.setBackgroundColor(colors.gray)
+  term.setTextColor(storageConnected and colors.lime or colors.orange)
+  term.write(" *")
+  term.setTextColor(colors.white)
+  term.write(" " .. timeStr .. " ")
+end
+
+local function drawStartMenu()
+  local x1, top, x2, bottom, step = getStartMenuBounds()
+  drawRaisedPanel(x1, top, x2, bottom, colors.lightGray)
+
+  for y = top + 1, bottom - 1 do
+    term.setCursorPos(x1 + 1, y)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.lightGray)
+    term.write("98")
+  end
+
+  for i, item in ipairs(startItems) do
+    local y = top + 1 + ((i - 1) * step)
+    if y < bottom then
+      term.setCursorPos(x1 + 4, y)
+      term.setBackgroundColor(item.color)
+      term.write(" ")
+      term.setBackgroundColor(colors.lightGray)
+      term.setTextColor(colors.black)
+      term.write(" " .. item.label:sub(1, x2 - x1 - 6))
+    end
+  end
+end
+
+-- ==========================================
+-- DESKTOP & APP VIEWS
+-- ==========================================
+local desktopIcons = {
+  { id = "control", label = "Control Panel", color = colors.green,  glyph = "SW" },
+  { id = "plant",   label = "Plant Output ", color = colors.orange, glyph = ">>" },
+  { id = "storage", label = "Base Storage ", color = colors.blue,   glyph = "[]" }
+}
+
+local function getDesktopIconPos(i)
+  local _, h = term.getSize()
+  local step = (h <= 14) and 3 or 4
+  return 3, 2 + ((i - 1) * step)
 end
 
 local function drawDesktop()
-  gpu.clear(disp, 0, 128, 128) -- Classic Win98 Teal
+  local w, h = term.getSize()
+  drawWallpaper()
 
   for i, icon in ipairs(desktopIcons) do
-    local ix, iy, iw, _ = getIconRect(i)
-    drawPixelIcon(icon.id, ix + 22, iy)
-    local tw = gpu.measureText(icon.label, FONT, 11, "plain").width or 64
-    local tx = ix + math.floor((iw - tw) / 2)
-    gpu.drawText(disp, icon.label, tx, iy + 36, 255, 255, 255, FONT, 11, "plain")
+    local ix, iy = getDesktopIconPos(i)
+
+    -- Framed Win98 Icon Tile
+    term.setCursorPos(ix, iy)
+    term.setBackgroundColor(colors.white)
+    term.write(" ")
+    term.setBackgroundColor(icon.color)
+    term.setTextColor(colors.white)
+    term.write(icon.glyph)
+    term.setBackgroundColor(colors.gray)
+    term.write(" ")
+
+    -- Transparent-look Icon Label (matches wallpaper pixel behind each letter)
+    for c = 1, #icon.label do
+      local lx = ix + 4 + c
+      local bg = getWallpaperColor(lx, iy, w, h)
+      term.setCursorPos(lx, iy)
+      term.setBackgroundColor(bg)
+      -- Use black text on white clouds/lime grass, white text on sky/dark grass
+      if bg == colors.white or bg == colors.lime then
+        term.setTextColor(colors.black)
+      else
+        term.setTextColor(colors.white)
+      end
+      term.write(icon.label:sub(c, c))
+    end
   end
 end
 
--- ==========================================
--- APP 1: CONTROL PANEL
--- ==========================================
-local function getSwitchRects(i, cx, cy, cw, ch)
-  local usableH = ch - 24
-  local rowH = math.floor(usableH / #btns)
-  local ry = cy + ((i - 1) * rowH) + 6
-  local btnW = 48
-  local btnH = math.min(24, rowH - 8)
-  local offX = cx + cw - btnW - 8
-  local onX  = offX - btnW - 8
-  return ry, onX, offX, btnW, btnH
+local function getControlBtnY(i, iy1, iy2)
+  local avail = math.max(1, (iy2 - 1) - iy1)
+  local step = math.max(1, math.min(3, math.floor(avail / #btns)))
+  return iy1 + ((i - 1) * step)
 end
 
 local function drawControlPanel()
-  gpu.clear(disp, 0, 128, 128)
-  local cx, cy, cw, ch = drawWindow("Control Panel")
+  drawWallpaper()
+  local ix1, iy1, ix2, iy2 = drawWindow("Control Panel")
 
   for i, b in ipairs(btns) do
-    local ry, onX, offX, btnW, btnH = getSwitchRects(i, cx, cy, cw, ch)
-    gpu.drawText(disp, b.name, cx + 8, ry + 5, 0, 0, 0, FONT, 13, "bold")
+    local by = getControlBtnY(i, iy1, iy2)
+    if by < iy2 then
+      term.setCursorPos(ix1 + 1, by)
+      term.setBackgroundColor(colors.lightGray)
+      term.setTextColor(colors.black)
+      term.write(b.name)
 
-    -- [ ON ] Button
-    local isOn = (b.state == "ON")
-    drawBevelBox(onX, ry, btnW, btnH, not isOn, isOn and 60 or 192, isOn and 210 or 192, isOn and 80 or 192)
-    gpu.drawText(disp, "ON", onX + 14, ry + 5, 0, 0, 0, FONT, 12, "bold")
+      term.setCursorPos(ix1 + 9, by)
+      term.setBackgroundColor(b.state == "ON" and colors.lime or colors.gray)
+      term.setTextColor(b.state == "ON" and colors.black or colors.white)
+      term.write(" ON ")
 
-    -- [ OFF ] Button
-    local isOff = (b.state == "OFF")
-    drawBevelBox(offX, ry, btnW, btnH, not isOff, isOff and 210 or 192, isOff and 60 or 192, isOff and 60 or 192)
-    gpu.drawText(disp, "OFF", offX + 11, ry + 5, isOff and 255 or 0, isOff and 255 or 0, isOff and 255 or 0, FONT, 12, "bold")
-  end
-
-  -- Sunken Status Bar
-  drawBevelBox(cx, cy + ch - 20, cw, 20, false, 192, 192, 192)
-  gpu.drawText(disp, status, cx + 6, cy + ch - 16, 0, 0, 0, FONT, 11, "plain")
+      term.setCursorPos(ix1 + 15, by)
+term.setBackgroundColor(b.state == "OFF" and colors.red or colors.gray)
+term.setTextColor(colors.white)
+term.write(" OFF ")
 end
-
--- ==========================================
--- APP 2: PLANT OUTPUT
--- ==========================================
+end
+term.setCursorPos(ix1, iy2)
+term.setBackgroundColor(colors.gray)
+term.setTextColor(colors.white)
+local innerW = math.max(1, ix2 - ix1 + 1)
+term.write((" " .. status):sub(1, innerW) .. string.rep(" ", math.max(0, innerW - #status - 1)))
+end
 local function drawPlantOutput()
-  gpu.clear(disp, 0, 128, 128)
-  local cx, cy, cw, ch = drawWindow("Plant Output")
-
-  local listH = ch - 24
-  drawBevelBox(cx, cy, cw, listH, false, 255, 255, 255)
-
-  -- Column Header Bar
-  drawBevelBox(cx + 2, cy + 2, cw - 4, 20, true, 192, 192, 192)
-  local colStock = cx + math.floor(cw * 0.52)
-  local colRate  = cx + math.floor(cw * 0.76)
-
-  gpu.drawText(disp, "Factory Line", cx + 8,   cy + 6, 0, 0, 0, FONT, 11, "bold")
-  gpu.drawText(disp, "Stock",        colStock, cy + 6, 0, 0, 0, FONT, 11, "bold")
-  gpu.drawText(disp, "Rate",         colRate,  cy + 6, 0, 0, 0, FONT, 11, "bold")
-
-  local rowH = math.floor((listH - 26) / #trackedPlants)
-  for i, p in ipairs(trackedPlants) do
-    local ry = cy + 24 + ((i - 1) * rowH)
-    local count = liveTotals[p.id] or 0
-    local rate = ratesPerMin[p.id] or 0
-
-    if i % 2 == 0 then
-gpu.fillRect(disp, cx + 2, ry, cw - 4, rowH, 242, 245, 250)
+drawWallpaper()
+local ix1, iy1, ix2, iy2 = drawWindow("Plant Output")
+drawSunkenBox(ix1, iy1, ix2, iy2 - 1, colors.white)
+local innerW = math.max(1, (ix2 - 1) - (ix1 + 1) + 1)
+term.setCursorPos(ix1 + 1, iy1 + 1)
+term.setBackgroundColor(colors.lightGray)
+term.setTextColor(colors.black)
+local hdr = "ITEM          STOCK   RATE"
+term.write(hdr:sub(1, innerW) .. string.rep(" ", math.max(0, innerW - #hdr)))
+for i, p in ipairs(trackedPlants) do
+local y = iy1 + 1 + i
+if y <= iy2 - 2 then
+local count = liveTotals[p.id] or 0
+local rate = ratesPerMin[p.id] or 0
+term.setCursorPos(ix1 + 1, y)
+term.setBackgroundColor(colors.white)
+term.setTextColor(colors.black)
+term.write(string.format("%-13s", p.label:sub(1, 13)))
+term.setCursorPos(ix1 + 15, y)
+term.setTextColor(colors.blue)
+term.write(string.format("%-7d", count))
+term.setCursorPos(ix1 + 23, y)
+term.setTextColor(rate > 0 and colors.green or colors.gray)
+term.write((rate >= 0 and "+" or "") .. rate .. "/m")
 end
-gpu.drawText(disp, p.label, cx + 8, ry + 4, 0, 0, 0, FONT, 12, "plain")
-gpu.drawText(disp, tostring(count), colStock, ry + 4, 0, 0, 160, FONT, 12, "bold")
-local rStr = (rate >= 0 and "+" or "") .. rate .. "/m"
-local rr, rg, rb = 120, 120, 120
-if rate > 0 then rr, rg, rb = 0, 140, 0 end
-gpu.drawText(disp, rStr, colRate, ry + 4, rr, rg, rb, FONT, 12, "bold")
 end
--- Sunken Status Bar
-drawBevelBox(cx, cy + ch - 20, cw, 20, false, 192, 192, 192)
-local syncTxt = storageConnected and "Wireless Storage Sync: ONLINE" or "Waiting for Storage Slave..."
-gpu.drawText(disp, syncTxt, cx + 6, cy + ch - 16, 0, 0, 0, FONT, 11, "plain")
-end
--- ==========================================
--- APP 3: BASE STORAGE EXPLORER
--- ==========================================
-local function getNextBtnRect(cx, cy, cw, ch)
-return cx, cy + ch - 22, 92, 22
+term.setCursorPos(ix1, iy2)
+term.setBackgroundColor(colors.lightGray)
+term.setTextColor(colors.black)
+term.write(storageConnected and "Status: Live Wireless Sync" or "Status: Waiting for Slave...")
 end
 local function drawStorage()
-gpu.clear(disp, 0, 128, 128)
-local cx, cy, cw, ch = drawWindow("Base Storage")
-local listH = ch - 28
-drawBevelBox(cx, cy, cw, listH, false, 255, 255, 255)
+drawWallpaper()
+local ix1, iy1, ix2, iy2 = drawWindow("Base Storage")
+drawSunkenBox(ix1, iy1, ix2, iy2 - 2, colors.white)
 local list = {}
 for id, count in pairs(liveTotals) do
 table.insert(list, { name = liveNames[id] or id, count = count })
 end
 table.sort(list, function(a, b) return a.count > b.count end)
-local rowH = 20
-local perPage = math.max(1, math.floor((listH - 8) / rowH))
+local listTop = iy1 + 1
+local listBottom = iy2 - 3
+local perPage = math.max(1, listBottom - listTop + 1)
 local maxPages = math.max(1, math.ceil(#list / perPage))
 if storagePage > maxPages then storagePage = 1 end
 local startIdx = (storagePage - 1) * perPage + 1
 for i = 0, perPage - 1 do
 local item = list[startIdx + i]
 if item then
-local ry = cy + 4 + (i * rowH)
-if i % 2 == 1 then
-gpu.fillRect(disp, cx + 2, ry, cw - 4, rowH, 242, 245, 250)
+term.setCursorPos(ix1 + 1, listTop + i)
+term.setBackgroundColor(colors.white)
+term.setTextColor(colors.black)
+term.write(string.format("%-18s", item.name:sub(1, 18)))
+term.setCursorPos(ix2 - 7, listTop + i)
+term.setTextColor(colors.blue)
+term.write(string.format("%6d", item.count))
 end
-gpu.drawText(disp, item.name, cx + 8, ry + 4, 0, 0, 0, FONT, 12, "plain")
-gpu.drawText(disp, tostring(item.count), cx + cw - 68, ry + 4, 0, 0, 160, FONT, 12, "bold")
 end
-end
--- Win98 Next Page Button
-local bx, by, bw, bh = getNextBtnRect(cx, cy, cw, ch)
-drawBevelBox(bx, by, bw, bh, true, 192, 192, 192)
-gpu.drawText(disp, "Next Page >", bx + 10, by + 5, 0, 0, 0, FONT, 11, "bold")
-gpu.drawText(disp, "Page " .. storagePage .. " of " .. maxPages .. " (" .. #list .. " items)", bx + bw + 12, by + 5, 0, 0, 0, FONT, 11, "plain")
-end
--- ==========================================
--- TASKBAR & START MENU
--- ==========================================
-local startItems = {
-{ id = "control", label = "Control Panel" },
-{ id = "plant",   label = "Plant Output"  },
-{ id = "storage", label = "Base Storage"  },
-{ id = "desktop", label = "Show Desktop"  }
-}
-local function getStartMenuRect()
-local mw = 156
-local mh = (#startItems * 28) + 8
-return 2, H - TASKBAR_H - mh, mw, mh
-end
-local function drawTaskbar()
-local ty = H - TASKBAR_H
-drawBevelBox(0, ty, W, TASKBAR_H, true, 192, 192, 192)
--- [Start] Button
-drawBevelBox(4, ty + 4, 66, 20, not startMenuOpen, 192, 192, 192)
-drawWinLogo(9, ty + 8)
-gpu.drawText(disp, "Start", 25, ty + 8, 0, 0, 0, FONT, 12, "bold")
--- Active Window Tab
-if currentApp ~= "desktop" then
-local tabNames = {
-control = "Control Panel",
-plant   = "Plant Output",
-storage = "Base Storage"
-}
-drawBevelBox(76, ty + 4, 116, 20, false, 215, 215, 215)
-gpu.drawText(disp, tabNames[currentApp] or currentApp, 84, ty + 8, 0, 0, 0, FONT, 11, "bold")
-end
--- System Tray
-local trayW = 78
-local trayX = W - trayW - 4
-drawBevelBox(trayX, ty + 4, trayW, 20, false, 192, 192, 192)
--- Wireless Sync Status LED
-if storageConnected then
-gpu.drawCircle(disp, trayX + 11, ty + 14, 4, 40, 200, 60, true)
-else
-gpu.drawCircle(disp, trayX + 11, ty + 14, 4, 230, 140, 20, true)
-end
-local timeStr = textutils.formatTime(os.time(), false)
-gpu.drawText(disp, timeStr, trayX + 20, ty + 8, 0, 0, 0, FONT, 11, "plain")
-end
-local function drawStartMenu()
-local mx, my, mw, mh = getStartMenuRect()
-drawBevelBox(mx, my, mw, mh, true, 192, 192, 192)
--- Classic Vertical Blue "Win98" Sidebar
-gpu.fillRect(disp, mx + 3, my + 3, 20, mh - 6, 0, 0, 128)
-gpu.drawText(disp, "98", mx + 6, my + mh - 20, 192, 192, 192, FONT, 12, "bold")
-for i, item in ipairs(startItems) do
-local iy = my + 4 + ((i - 1) * 28)
-drawPixelIcon(item.id == "desktop" and "control" or item.id, mx + 28, iy - 2)
-gpu.drawText(disp, item.label, mx + 66, iy + 6, 0, 0, 0, FONT, 12, "plain")
-end
+term.setCursorPos(ix1, iy2)
+term.setBackgroundColor(colors.gray)
+term.setTextColor(colors.white)
+term.write(" Next Page > ")
+term.setCursorPos(ix1 + 15, iy2)
+term.setBackgroundColor(colors.lightGray)
+term.setTextColor(colors.black)
+term.write("Page " .. storagePage .. "/" .. maxPages)
 end
 -- ==========================================
--- MASTER RENDER & HIT-TEST HELPER
+-- MASTER RENDER & EVENT LOOP
 -- ==========================================
-local function hit(px, py, x, y, w, h)
-return px >= x and px <= x + w and py >= y and py <= y + h
-end
 local function render()
 if currentApp == "desktop" then
 drawDesktop()
@@ -406,100 +427,78 @@ drawTaskbar()
 if startMenuOpen then
 drawStartMenu()
 end
-gpu.updateDisplay(disp)
 end
--- ==========================================
--- PARALLEL EVENT LOOPS (GPU + REDNET + CLOCK)
--- ==========================================
 render()
-parallel.waitForAny(
--- Loop 1: DirectGPU Touch / Mouse Input
-function()
+local clockTimer = os.startTimer(5)
 while true do
-if gpu.hasEvents(disp) then
-local ev = gpu.pollEvent(disp)
-if ev and ev.type == "mouse_click" then
-local px, py = ev.x, ev.y
-local cx, cy, cw, ch = getWindowRect()
-cx, cy, cw, ch = cx + 8, cy + 28, cw - 16, ch - 36
--- 1. Start Menu Clicks
+local event, p1, p2, p3 = os.pullEvent()
+if event == "timer" and p1 == clockTimer then
+render()
+clockTimer = os.startTimer(5)
+elseif event == "rednet_message" and p3 == STORAGE_PROTOCOL then
+processIncomingStorage(p2)
+render()
+elseif event == "monitor_touch" then
+local x, y = p2, p3
+local w, h = term.getSize()
+local ix1, iy1, _, iy2 = getWindowInnerBounds()
 if startMenuOpen then
-local mx, my, mw, mh = getStartMenuRect()
-local picked = false
-if hit(px, py, mx, my, mw, mh) then
+local sx1, top, sx2, bottom, step = getStartMenuBounds()
+local clickedMenu = false
+if x >= sx1 and x <= sx2 and y >= top and y <= bottom then
 for i, item in ipairs(startItems) do
-local iy = my + 4 + ((i - 1) * 28)
-if hit(px, py, mx + 24, iy, mw - 26, 26) then
+local iy = top + 1 + ((i - 1) * step)
+if y == iy then
 currentApp = item.id
 storagePage = 1
-picked = true
+clickedMenu = true
 break
 end
 end
 end
 startMenuOpen = false
 render()
-if picked then goto next_ev end
+if clickedMenu then goto continue end
 end
--- 2. Taskbar [Start] Button
-if hit(px, py, 4, H - TASKBAR_H + 4, 66, 20) then
+if y == h and x >= 1 and x <= 7 then
 startMenuOpen = not startMenuOpen
 render()
--- 3. Window [X] Close Button
-elseif currentApp ~= "desktop" and hit(px, py, getCloseBtnRect()) then
+elseif currentApp ~= "desktop" and y == 3 and x >= w - 4 and x <= w - 2 then
 currentApp = "desktop"
 render()
--- 4. Desktop Icon Clicks
 elseif currentApp == "desktop" then
 for i, icon in ipairs(desktopIcons) do
-if hit(px, py, getIconRect(i)) then
+local dx, dy = getDesktopIconPos(i)
+if y == dy and x >= dx and x <= dx + 18 then
 currentApp = icon.id
 storagePage = 1
 render()
 break
 end
 end
--- 5. Control Panel Switch Clicks
 elseif currentApp == "control" then
 for i, b in ipairs(btns) do
-local ry, onX, offX, btnW, btnH = getSwitchRects(i, cx, cy, cw, ch)
-if hit(px, py, onX, ry, btnW, btnH) then
+local by = getControlBtnY(i, iy1, iy2)
+if y == by then
+if x >= ix1 + 9 and x <= ix1 + 12 then
 b.state = "ON"
 rednet.broadcast(b.msg .. "_on")
 status = "Sent: " .. b.msg .. "_on"
 render()
-elseif hit(px, py, offX, ry, btnW, btnH) then
+elseif x >= ix1 + 15 and x <= ix1 + 19 then
 b.state = "OFF"
 rednet.broadcast(b.msg .. "_off")
 status = "Sent: " .. b.msg .. "_off"
 render()
 end
 end
--- 6. Base Storage Next Page Button
+end
 elseif currentApp == "storage" then
-if hit(px, py, getNextBtnRect(cx, cy, cw, ch)) then
+if y == iy2 and x >= ix1 and x <= ix1 + 12 then
 storagePage = storagePage + 1
 render()
 end
 end
-::next_ev::
+::continue::
 end
 end
-sleep(0.05)
-end
-end,
--- Loop 2: Wireless Storage Slave & Clock Updates
-function()
-local clockTimer = os.startTimer(5)
-while true do
-local event, p1, p2, p3 = os.pullEvent()
-if event == "rednet_message" and p3 == STORAGE_PROTOCOL then
-processIncomingStorage(p2)
-render()
-elseif event == "timer" and p1 == clockTimer then
-render()
-clockTimer = os.startTimer(5)
-end
-end
-end
-)
