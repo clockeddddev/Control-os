@@ -1,5 +1,5 @@
 -- ==========================================
--- PERIPHERAL SETUP
+-- BASE CONTROL OS 98 (Wireless Client)
 -- ==========================================
 peripheral.find("modem", rednet.open)
 local mon = peripheral.find("monitor")
@@ -7,13 +7,10 @@ assert(mon, "No monitor attached!")
 mon.setTextScale(0.5)
 term.redirect(mon)
 
--- Auto-detect Create Stock Ticker (6.0+) OR Item Vaults/Chests
-local ticker = peripheral.find("Create_StockTicker")
-local vaults = { peripheral.find("inventory") }
+local STORAGE_PROTOCOL = "base_storage_sync"
 
 -- ==========================================
 -- CONFIG: ITEMS TO TRACK IN "PLANT OUTPUT"
--- (Use exact Minecraft/Create item IDs)
 -- ==========================================
 local trackedPlants = {
   { id = "create:andesite_alloy", label = "Andesite Alloy" },
@@ -26,314 +23,443 @@ local trackedPlants = {
 -- ==========================================
 -- STATE VARIABLES
 -- ==========================================
-local currentApp = "menu" -- "menu", "control", "plant", "storage"
+local currentApp = "desktop"
+local startMenuOpen = false
 local status = "Ready"
 local storagePage = 1
+local storageConnected = false
 
--- Control Panel Buttons
+local liveTotals = {}
+local liveNames = {}
+
 local btns = {
-  { name = "LIGHTS", y = 4,  state = "OFF", msg = "lights" },
-  { name = "DOOR  ", y = 7,  state = "OFF", msg = "door"   },
-  { name = "FARM  ", y = 10, state = "OFF", msg = "farm"   },
-  { name = "ALARM ", y = 13, state = "OFF", msg = "alarm"  }
+  { name = "LIGHTS", state = "OFF", msg = "lights" },
+  { name = "DOOR  ", state = "OFF", msg = "door"   },
+  { name = "FARM  ", state = "OFF", msg = "farm"   },
+  { name = "ALARM ", state = "OFF", msg = "alarm"  }
 }
 
--- Rate tracking for Plant Output
 local lastCounts = {}
 local ratesPerMin = {}
 local lastScanTime = os.epoch("utc") / 1000
 
--- ==========================================
--- STORAGE HELPER FUNCTIONS
--- ==========================================
-local function getAllStock()
-  local totals = {}
-  local names = {}
+local function processIncomingStorage(data)
+  if type(data) ~= "table" or not data.totals then return end
+  liveTotals = data.totals
+  liveNames = data.names or {}
+  storageConnected = true
 
-  if ticker then
-    -- Create 6.0+ Stock Ticker API
-    local items = ticker.stock(true)
-    for _, item in pairs(items) do
-      totals[item.name] = (totals[item.name] or 0) + item.count
-      names[item.name] = item.displayName or item.name
-    end
-  else
-    -- Fallback: Scan all connected Item Vaults / Chests
-    for _, inv in ipairs(vaults) do
-      for slot, item in pairs(inv.list()) do
-        totals[item.name] = (totals[item.name] or 0) + item.count
-        if not names[item.name] then
-          local detail = inv.getItemDetail(slot)
-          names[item.name] = (detail and detail.displayName) or item.name
-        end
-      end
-    end
-  end
-
-  return totals, names
-end
-
-local function updatePlantRates()
   local now = os.epoch("utc") / 1000
   local elapsed = now - lastScanTime
-  if elapsed < 1 then return end
-
-  local totals = getAllStock()
-  for _, p in ipairs(trackedPlants) do
-    local current = totals[p.id] or 0
-    if lastCounts[p.id] ~= nil then
-      local diff = current - lastCounts[p.id]
-      ratesPerMin[p.id] = math.floor((diff / elapsed) * 60)
-    else
-      ratesPerMin[p.id] = 0
+  if elapsed >= 1 then
+    for _, p in ipairs(trackedPlants) do
+      local current = liveTotals[p.id] or 0
+      if lastCounts[p.id] ~= nil then
+        local diff = current - lastCounts[p.id]
+        ratesPerMin[p.id] = math.floor((diff / elapsed) * 60)
+      else
+        ratesPerMin[p.id] = 0
+      end
+      lastCounts[p.id] = current
     end
-    lastCounts[p.id] = current
+    lastScanTime = now
   end
-  lastScanTime = now
 end
 
 -- ==========================================
--- UI DRAWING HELPERS
+-- WIN98 UI DRAWING PRIMITIVES
 -- ==========================================
-local function drawHeader(title, showHome)
-  local w, _ = term.getSize()
-  term.setCursorPos(1, 1)
+local function fillRect(x1, y1, x2, y2, bg)
+  if x2 < x1 or y2 < y1 then return end
+  term.setBackgroundColor(bg)
+  for y = y1, y2 do
+    term.setCursorPos(x1, y)
+    term.write(string.rep(" ", x2 - x1 + 1))
+  end
+end
+
+local function drawRaisedPanel(x1, y1, x2, y2, bg)
+  fillRect(x1, y1, x2, y2, bg or colors.lightGray)
+  term.setBackgroundColor(colors.white)
+  term.setCursorPos(x1, y1)
+  term.write(string.rep(" ", x2 - x1))
+  for y = y1, y2 - 1 do
+    term.setCursorPos(x1, y)
+    term.write(" ")
+  end
+  term.setBackgroundColor(colors.gray)
+  term.setCursorPos(x1, y2)
+  term.write(string.rep(" ", x2 - x1 + 1))
+  for y = y1 + 1, y2 do
+    term.setCursorPos(x2, y)
+    term.write(" ")
+  end
+end
+
+local function drawSunkenBox(x1, y1, x2, y2, bg)
+  fillRect(x1, y1, x2, y2, bg or colors.white)
+  term.setBackgroundColor(colors.gray)
+  term.setCursorPos(x1, y1)
+  term.write(string.rep(" ", x2 - x1))
+  for y = y1, y2 - 1 do
+    term.setCursorPos(x1, y)
+    term.write(" ")
+  end
+  term.setBackgroundColor(colors.white)
+  term.setCursorPos(x1, y2)
+  term.write(string.rep(" ", x2 - x1 + 1))
+  for y = y1 + 1, y2 do
+    term.setCursorPos(x2, y)
+    term.write(" ")
+  end
+end
+
+local function getWindowInnerBounds()
+  local w, h = term.getSize()
+  local x1, y1 = 2, 2
+  local x2, y2 = w - 1, h - 2
+  return x1 + 2, y1 + 3, x2 - 2, y2 - 1
+end
+
+local function drawWindow(title)
+  local w, h = term.getSize()
+  local x1, y1 = 2, 2
+  local x2, y2 = w - 1, h - 2
+
+  drawRaisedPanel(x1, y1, x2, y2, colors.lightGray)
+
+  term.setCursorPos(x1 + 1, y1 + 1)
   term.setBackgroundColor(colors.blue)
-  term.clearLine()
   term.setTextColor(colors.white)
-  term.write(" " .. title)
+  term.write(string.rep(" ", x2 - x1 - 1))
+  term.setCursorPos(x1 + 2, y1 + 1)
+  term.write(title:sub(1, x2 - x1 - 6))
 
-  if showHome then
-    term.setCursorPos(w - 6, 1)
-    term.setBackgroundColor(colors.red)
-    term.setTextColor(colors.white)
-    term.write(" HOME ")
-  end
-end
+  term.setCursorPos(x2 - 3, y1 + 1)
+  term.setBackgroundColor(colors.lightGray)
+  term.setTextColor(colors.black)
+  term.write(" X ")
 
-local function drawFooter(text)
-  local _, h = term.getSize()
-  term.setCursorPos(1, h)
-  term.setBackgroundColor(colors.black)
-  term.clearLine()
-  term.setTextColor(colors.yellow)
-  term.write(" > " .. text)
+  return getWindowInnerBounds()
 end
 
 -- ==========================================
--- APP 1: MAIN MENU
+-- TASKBAR & START MENU
 -- ==========================================
-local menuItems = {
-  { id = "control", label = "Control Panel", desc = "Rednet base switches", y = 4,  color = colors.green  },
-  { id = "plant",   label = "Plant Output ", desc = "Live items/min rates", y = 8,  color = colors.orange },
-  { id = "storage", label = "Base Storage ", desc = "Browse Create stock ", y = 12, color = colors.cyan   }
+local startItems = {
+  { id = "control", label = "Control Panel", color = colors.green  },
+  { id = "plant",   label = "Plant Output ", color = colors.orange },
+  { id = "storage", label = "Base Storage ", color = colors.cyan   },
+  { id = "desktop", label = "Show Desktop ", color = colors.blue   }
 }
 
-local function drawMenu()
-  term.setBackgroundColor(colors.gray)
-  term.clear()
-  drawHeader("BASE CONTROL OS", false)
-
-  for _, item in ipairs(menuItems) do
-    term.setCursorPos(3, item.y)
-    term.setBackgroundColor(item.color)
-    term.setTextColor(colors.black)
-    term.write("  " .. item.label .. "  ")
-
-    term.setCursorPos(3, item.y + 1)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.lightGray)
-    term.write(item.desc)
-  end
-
-  local linkStatus = ticker and "Create Stock Link OK" or (#vaults .. " Vault(s) Connected")
-  drawFooter(linkStatus)
+local function getStartMenuBounds()
+  local _, h = term.getSize()
+  local compact = (h < 14)
+  local step = compact and 1 or 2
+  local top = math.max(1, h - (#startItems * step) - 1)
+  return 1, top, 20, h - 1, step
 end
 
--- ==========================================
--- APP 2: CONTROL PANEL (Your Rednet App)
--- ==========================================
-local function drawControlPanel()
-  term.setBackgroundColor(colors.gray)
-  term.clear()
-  drawHeader("CONTROL PANEL", true)
-
-  for _, b in ipairs(btns) do
-    term.setCursorPos(3, b.y)
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.white)
-    term.write(b.name)
-
-    term.setCursorPos(11, b.y)
-    term.setBackgroundColor(b.state == "ON" and colors.lime or colors.green)
-    term.setTextColor(colors.black)
-    term.write(" ON ")
-
-    term.setCursorPos(17, b.y)
-    term.setBackgroundColor(b.state == "OFF" and colors.red or colors.brown)
-    term.setTextColor(colors.white)
-    term.write(" OFF ")
-  end
-
-  drawFooter(status)
-end
-
--- ==========================================
--- APP 3: PLANT OUTPUT MONITOR
--- ==========================================
-local function drawPlantOutput()
-  term.setBackgroundColor(colors.black)
-  term.clear()
-  drawHeader("PLANT OUTPUT", true)
-
-  local totals = getAllStock()
-
-  term.setCursorPos(2, 3)
-  term.setBackgroundColor(colors.black)
-  term.setTextColor(colors.lightGray)
-  term.write("ITEM            STOCK    RATE")
-
-  for i, p in ipairs(trackedPlants) do
-    local y = 4 + (i * 2)
-    local count = totals[p.id] or 0
-    local rate = ratesPerMin[p.id] or 0
-
-    term.setCursorPos(2, y)
-    term.setTextColor(colors.white)
-    term.write(string.format("%-15s", p.label:sub(1, 15)))
-
-    term.setCursorPos(18, y)
-    term.setTextColor(colors.cyan)
-    term.write(string.format("%-8d", count))
-
-    term.setCursorPos(26, y)
-    term.setTextColor(rate > 0 and colors.lime or colors.gray)
-    term.write((rate >= 0 and "+" or "") .. rate .. "/m")
-  end
-
-  drawFooter("Auto-refreshing every 3s")
-end
-
--- ==========================================
--- APP 4: BASE STORAGE BROWSER
--- ==========================================
-local function drawStorage()
+local function drawTaskbar()
   local w, h = term.getSize()
-  term.setBackgroundColor(colors.black)
-  term.clear()
-  drawHeader("BASE STORAGE", true)
+  term.setCursorPos(1, h)
+  term.setBackgroundColor(colors.lightGray)
+  term.clearLine()
 
-  local totals, names = getAllStock()
-  local list = {}
-  for id, count in pairs(totals) do
-    table.insert(list, { name = names[id], count = count })
+  term.setCursorPos(1, h)
+  term.setBackgroundColor(startMenuOpen and colors.gray or colors.green)
+  term.setTextColor(colors.white)
+  term.write(" Start ")
+
+  if currentApp ~= "desktop" then
+    local tabNames = {
+      control = "Control Panel",
+      plant   = "Plant Output",
+      storage = "Base Storage"
+    }
+    term.setCursorPos(9, h)
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.white)
+    term.write(" " .. (tabNames[currentApp] or currentApp) .. " ")
   end
-  table.sort(list, function(a, b) return a.count > b.count end)
 
-  local perPage = h - 6
-  local maxPages = math.max(1, math.ceil(#list / perPage))
-  if storagePage > maxPages then storagePage = 1 end
+  local timeStr = textutils.formatTime(os.time(), false)
+  local trayW = #timeStr + 4
+  term.setCursorPos(w - trayW + 1, h)
+  term.setBackgroundColor(colors.gray)
+  term.setTextColor(storageConnected and colors.lime or colors.orange)
+  term.write(" *")
+  term.setTextColor(colors.white)
+  term.write(" " .. timeStr .. " ")
+end
 
-  local startIdx = (storagePage - 1) * perPage + 1
-  for i = 0, perPage - 1 do
-    local item = list[startIdx + i]
-    if item then
-      term.setCursorPos(2, 3 + i)
+local function drawStartMenu()
+  local x1, top, x2, bottom, step = getStartMenuBounds()
+  drawRaisedPanel(x1, top, x2, bottom, colors.lightGray)
+
+  for y = top + 1, bottom - 1 do
+    term.setCursorPos(x1 + 1, y)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.lightGray)
+    term.write("98")
+  end
+
+  for i, item in ipairs(startItems) do
+    local y = top + 1 + ((i - 1) * step)
+    if y < bottom then
+      term.setCursorPos(x1 + 4, y)
+      term.setBackgroundColor(item.color)
+      term.write(" ")
+      term.setBackgroundColor(colors.lightGray)
+      term.setTextColor(colors.black)
+      term.write(" " .. item.label:sub(1, x2 - x1 - 6))
+    end
+  end
+end
+
+-- ==========================================
+-- DESKTOP & APP VIEWS
+-- ==========================================
+local desktopIcons = {
+  { id = "control", label = "Control Panel", color = colors.green,  glyph = "SW" },
+  { id = "plant",   label = "Plant Output ", color = colors.orange, glyph = ">>" },
+  { id = "storage", label = "Base Storage ", color = colors.blue,   glyph = "[]" }
+}
+
+local function getDesktopIconPos(i)
+  local _, h = term.getSize()
+  local step = (h <= 14) and 3 or 4
+  return 3, 2 + ((i - 1) * step)
+end
+
+local function drawDesktop()
+  term.setBackgroundColor(colors.cyan)
+  term.clear()
+
+  for i, icon in ipairs(desktopIcons) do
+    local ix, iy = getDesktopIconPos(i)
+    term.setCursorPos(ix, iy)
+    term.setBackgroundColor(colors.white)
+    term.setTextColor(colors.black)
+    term.write(" ")
+    term.setBackgroundColor(icon.color)
+    term.setTextColor(colors.white)
+    term.write(icon.glyph)
+    term.setBackgroundColor(colors.gray)
+    term.write(" ")
+
+    term.setCursorPos(ix + 5, iy)
+    term.setBackgroundColor(colors.cyan)
+    term.setTextColor(colors.white)
+    term.write(icon.label)
+  end
+end
+
+local function getControlBtnY(i, iy1, iy2)
+  local avail = math.max(1, (iy2 - 1) - iy1)
+  local step = math.max(1, math.min(3, math.floor(avail / #btns)))
+  return iy1 + ((i - 1) * step)
+end
+
+local function drawControlPanel()
+  term.setBackgroundColor(colors.cyan)
+  term.clear()
+  local ix1, iy1, ix2, iy2 = drawWindow("Control Panel")
+
+  for i, b in ipairs(btns) do
+    local by = getControlBtnY(i, iy1, iy2)
+    if by < iy2 then
+      term.setCursorPos(ix1 + 1, by)
+      term.setBackgroundColor(colors.lightGray)
+      term.setTextColor(colors.black)
+      term.write(b.name)
+
+      term.setCursorPos(ix1 + 9, by)
+      term.setBackgroundColor(b.state == "ON" and colors.lime or colors.gray)
+      term.setTextColor(b.state == "ON" and colors.black or colors.white)
+      term.write(" ON ")
+
+      term.setCursorPos(ix1 + 15, by)
+      term.setBackgroundColor(b.state == "OFF" and colors.red or colors.gray)
       term.setTextColor(colors.white)
-      term.write(string.format("%-20s", item.name:sub(1, 20)))
-      term.setCursorPos(23, 3 + i)
-      term.setTextColor(colors.lime)
-      term.write(tostring(item.count))
+      term.write(" OFF ")
     end
   end
 
-  -- Page Controls
-  term.setCursorPos(2, h - 2)
-  term.setBackgroundColor(colors.blue)
+  term.setCursorPos(ix1, iy2)
+  term.setBackgroundColor(colors.gray)
   term.setTextColor(colors.white)
-  term.write(" NEXT PAGE ")
-
-  term.setCursorPos(15, h - 2)
-  term.setBackgroundColor(colors.black)
-  term.setTextColor(colors.lightGray)
-  term.write("Page " .. storagePage .. "/" .. maxPages)
-
-  drawFooter("Total unique items: " .. #list)
+  local innerW = math.max(1, ix2 - ix1 + 1)
+  term.write((" " .. status):sub(1, innerW) .. string.rep(" ", math.max(0, innerW - #status - 1)))
 end
 
+local function drawPlantOutput()
+  term.setBackgroundColor(colors.cyan)
+  term.clear()
+  local ix1, iy1, ix2, iy2 = drawWindow("Plant Output")
+
+  drawSunkenBox(ix1, iy1, ix2, iy2 - 1, colors.white)
+
+  local innerW = math.max(1, (ix2 - 1) - (ix1 + 1) + 1)
+  term.setCursorPos(ix1 + 1, iy1 + 1)
+  term.setBackgroundColor(colors.lightGray)
+  term.setTextColor(colors.black)
+  local hdr = "ITEM          STOCK   RATE"
+  term.write(hdr:sub(1, innerW) .. string.rep(" ", math.max(0, innerW - #hdr)))
+
+  for i, p in ipairs(trackedPlants) do
+    local y = iy1 + 1 + i
+    if y <= iy2 - 2 then
+      local count = liveTotals[p.id] or 0
+      local rate = ratesPerMin[p.id] or 0
+
+      term.setCursorPos(ix1 + 1, y)
+      term.setBackgroundColor(colors.white)
+      term.setTextColor(colors.black)
+      term.write(string.format("%-13s", p.label:sub(1, 13)))
+
+      term.setCursorPos(ix1 + 15, y)
+      term.setTextColor(colors.blue)
+      term.write(string.format("%-7d", count))
+
+      term.setCursorPos(ix1 + 23, y)
+      term.setTextColor(rate > 0 and colors.green or colors.gray)
+      term.write((rate >= 0 and "+" or "") .. rate .. "/m")
+    end
+  end
+
+  term.setCursorPos(ix1, iy2)
+term.setBackgroundColor(colors.lightGray)
+term.setTextColor(colors.black)
+term.write(storageConnected and "Status: Live Wireless Sync" or "Status: Waiting for Slave...")
+end
+local function drawStorage()
+term.setBackgroundColor(colors.cyan)
+term.clear()
+local ix1, iy1, ix2, iy2 = drawWindow("Base Storage")
+drawSunkenBox(ix1, iy1, ix2, iy2 - 2, colors.white)
+local list = {}
+for id, count in pairs(liveTotals) do
+table.insert(list, { name = liveNames[id] or id, count = count })
+end
+table.sort(list, function(a, b) return a.count > b.count end)
+local listTop = iy1 + 1
+local listBottom = iy2 - 3
+local perPage = math.max(1, listBottom - listTop + 1)
+local maxPages = math.max(1, math.ceil(#list / perPage))
+if storagePage > maxPages then storagePage = 1 end
+local startIdx = (storagePage - 1) * perPage + 1
+for i = 0, perPage - 1 do
+local item = list[startIdx + i]
+if item then
+term.setCursorPos(ix1 + 1, listTop + i)
+term.setBackgroundColor(colors.white)
+term.setTextColor(colors.black)
+term.write(string.format("%-18s", item.name:sub(1, 18)))
+term.setCursorPos(ix2 - 7, listTop + i)
+term.setTextColor(colors.blue)
+term.write(string.format("%6d", item.count))
+end
+end
+term.setCursorPos(ix1, iy2)
+term.setBackgroundColor(colors.gray)
+term.setTextColor(colors.white)
+term.write(" Next Page > ")
+term.setCursorPos(ix1 + 15, iy2)
+term.setBackgroundColor(colors.lightGray)
+term.setTextColor(colors.black)
+term.write("Page " .. storagePage .. "/" .. maxPages)
+end
 -- ==========================================
 -- MASTER RENDER & EVENT LOOP
 -- ==========================================
 local function render()
-  if currentApp == "menu" then
-    drawMenu()
-  elseif currentApp == "control" then
-    drawControlPanel()
-  elseif currentApp == "plant" then
-    drawPlantOutput()
-  elseif currentApp == "storage" then
-    drawStorage()
-  end
+if currentApp == "desktop" then
+drawDesktop()
+elseif currentApp == "control" then
+drawControlPanel()
+elseif currentApp == "plant" then
+drawPlantOutput()
+elseif currentApp == "storage" then
+drawStorage()
 end
-
-updatePlantRates()
+drawTaskbar()
+if startMenuOpen then
+drawStartMenu()
+end
+end
 render()
-local refreshTimer = os.startTimer(3)
-
+local clockTimer = os.startTimer(5)
 while true do
-  local event, p1, p2, p3 = os.pullEvent()
-
-  if event == "timer" and p1 == refreshTimer then
-    updatePlantRates()
-    if currentApp == "plant" or currentApp == "storage" then
-      render()
-    end
-    refreshTimer = os.startTimer(3)
-
-  elseif event == "monitor_touch" then
-    local x, y = p2, p3
-    local w, h = term.getSize()
-
-    -- Check Top-Right [ HOME ] Button when inside an app
-    if currentApp ~= "menu" and y == 1 and x >= w - 6 then
-      currentApp = "menu"
-      render()
-
-    -- Main Menu Touches
-    elseif currentApp == "menu" then
-      for _, item in ipairs(menuItems) do
-        if y == item.y or y == item.y + 1 then
-          currentApp = item.id
-          storagePage = 1
-          render()
-          break
-        end
-      end
-
-    -- Control Panel Touches
-    elseif currentApp == "control" then
-      for _, b in ipairs(btns) do
-        if y == b.y then
-          if x >= 11 and x <= 14 then
-            b.state = "ON"
-            rednet.broadcast(b.msg .. "_on")
-            status = "Sent: " .. b.msg .. "_on"
-            render()
-          elseif x >= 17 and x <= 21 then
-            b.state = "OFF"
-            rednet.broadcast(b.msg .. "_off")
-            status = "Sent: " .. b.msg .. "_off"
-            render()
-          end
-        end
-      end
-
-    -- Base Storage Touches
-    elseif currentApp == "storage" then
-      if y == h - 2 and x >= 2 and x <= 12 then
-        storagePage = storagePage + 1
-        render()
-      end
-    end
-  end
+local event, p1, p2, p3 = os.pullEvent()
+if event == "timer" and p1 == clockTimer then
+render()
+clockTimer = os.startTimer(5)
+elseif event == "rednet_message" and p3 == STORAGE_PROTOCOL then
+processIncomingStorage(p2)
+render()
+elseif event == "monitor_touch" then
+local x, y = p2, p3
+local w, h = term.getSize()
+local ix1, iy1, _, iy2 = getWindowInnerBounds()
+if startMenuOpen then
+local sx1, top, sx2, bottom, step = getStartMenuBounds()
+local clickedMenu = false
+if x >= sx1 and x <= sx2 and y >= top and y <= bottom then
+for i, item in ipairs(startItems) do
+local iy = top + 1 + ((i - 1) * step)
+if y == iy then
+currentApp = item.id
+storagePage = 1
+clickedMenu = true
+break
+end
+end
+end
+startMenuOpen = false
+render()
+if clickedMenu then goto continue end
+end
+if y == h and x >= 1 and x <= 7 then
+startMenuOpen = not startMenuOpen
+render()
+elseif currentApp ~= "desktop" and y == 3 and x >= w - 4 and x <= w - 2 then
+currentApp = "desktop"
+render()
+elseif currentApp == "desktop" then
+for i, icon in ipairs(desktopIcons) do
+local dx, dy = getDesktopIconPos(i)
+if y == dy and x >= dx and x <= dx + 18 then
+currentApp = icon.id
+storagePage = 1
+render()
+break
+end
+end
+elseif currentApp == "control" then
+for i, b in ipairs(btns) do
+local by = getControlBtnY(i, iy1, iy2)
+if y == by then
+if x >= ix1 + 9 and x <= ix1 + 12 then
+b.state = "ON"
+rednet.broadcast(b.msg .. "_on")
+status = "Sent: " .. b.msg .. "_on"
+render()
+elseif x >= ix1 + 15 and x <= ix1 + 19 then
+b.state = "OFF"
+rednet.broadcast(b.msg .. "_off")
+status = "Sent: " .. b.msg .. "_off"
+render()
+end
+end
+end
+elseif currentApp == "storage" then
+if y == iy2 and x >= ix1 and x <= ix1 + 12 then
+storagePage = storagePage + 1
+render()
+end
+end
+::continue::
+end
 end
