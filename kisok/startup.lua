@@ -1,5 +1,5 @@
 -- ==========================================
--- PINEAPPLE STORE OS (Apple Design System)
+-- PINEAPPLE STORE OS (Numismatics + Tag Builder)
 -- ==========================================
 peripheral.find("modem", rednet.open)
 local mon = peripheral.find("monitor")
@@ -7,74 +7,76 @@ assert(mon, "No monitor attached!")
 mon.setTextScale(0.5)
 term.redirect(mon)
 
--- Attach the deposit chest/barrel (wired or adjacent)
-local depositor = peripheral.find("minecraft:chest")
-  or peripheral.find("minecraft:barrel")
-  or peripheral.find("inventory")
+-- Optional Numismatics Depositor peripheral (e.g., via CC: Numismatics)
+local depositor = peripheral.find("numismatics_depositor")
+-- Side where the Numismatics Depositor emits its payment pulse (if using redstone)
+local DEPOSITOR_REDSTONE_SIDE = "right"
 
 local STORAGE_PROTOCOL = "base_storage_sync"
 local ORDER_PROTOCOL   = "pineapple_order"
 
 -- ==========================================
--- CONFIG: CURRENCY & CATALOG WITH VARIATIONS
+-- CONFIG: PINEAPPLE PHONE + CAPABILITY TAGS
 -- ==========================================
-local CURRENCY_ID    = "minecraft:diamond"
-local CURRENCY_LABEL = "Diamonds"
+local CURRENCY_LABEL = "Spurs"
 
-local CATALOG = {
-  {
-    name = "Pineapple Phone 16",
-    tagline = "Pro titanium. Unmatched power.",
-    category = "Phones",
-    variations = {
-      { label = "Standard (128GB)", id = "computercraft:pocket_computer_normal",   price = 4,  channel = "phone16_std" },
-      { label = "Pro (256GB)",      id = "computercraft:pocket_computer_advanced", price = 8,  channel = "phone16_pro" },
-      { label = "Pro Max (1TB)",    id = "computercraft:pocket_computer_advanced", price = 14, channel = "phone16_max" }
-    }
-  },
-  {
-    name = "Pineapple Phone SE",
-    tagline = "Compact. Essential. Fast.",
-    category = "Phones",
-    variations = {
-      { label = "Midnight (64GB)",  id = "computercraft:pocket_computer_normal",   price = 2,  channel = "phonese_blk" },
-      { label = "Starlight (128GB)",id = "computercraft:pocket_computer_normal",   price = 3,  channel = "phonese_wht" }
-    }
-  },
-  {
-    name = "Create Starter Kit",
-    tagline = "Precision mechanical engineering.",
-    category = "Hardware",
-    variations = {
-      { label = "Andesite Pack x16", id = "create:andesite_alloy", price = 2, channel = "kit_andesite" },
-      { label = "Brass Pack x16",    id = "create:brass_ingot",    price = 5, channel = "kit_brass"    }
-    }
-  },
-  {
-    name = "Factory Materials",
-    tagline = "Bulk resources on demand.",
-    category = "Materials",
-    variations = {
-      { label = "Iron Ingots x32",   id = "minecraft:iron_ingot",  price = 2, channel = "mat_iron"     },
-      { label = "Gold Ingots x32",   id = "minecraft:gold_ingot",  price = 4, channel = "mat_gold"     }
-    }
-  }
+local PHONE_CONFIG = {
+  name      = "Pineapple Phone",
+  tagline   = "One phone. Modular tags.",
+  itemId    = "computercraft:pocket_computer_advanced",
+  basePrice = 16, -- base price in spurs
+  channel   = "pineapple_phone_custom"
+}
+
+-- Toggleable tags: players can pick any combination
+local PHONE_TAGS = {
+  { id = "data-plan", label = "Data Plan",  price = 8,  color = colors.cyan    },
+  { id = "wireless",  label = "Wireless",   price = 6,  color = colors.blue    },
+  { id = "ender",     label = "Ender",      price = 12, color = colors.purple  },
+  { id = "program",   label = "Program",    price = 10, color = colors.orange  },
+  { id = "developer", label = "Developer",  price = 15, color = colors.magenta }
 }
 
 -- ==========================================
 -- STATE VARIABLES
 -- ==========================================
-local currentView      = "home" -- "home", "store", "checkout", "receipt"
-local selectedItemIdx  = 1
-local selectedVarIdx   = 1
+local currentView      = "home" -- "home", "builder", "checkout", "receipt"
+local selectedTags     = {}     -- map[tagId] = true/false
 local orderQty         = 1
-local scrollOffset     = 0
-local statusMessage    = "Ready"
 local lastOrderSummary = nil
+local paymentDetected  = false
 
 local storageConnected = false
 local liveTotals       = {}
 local liveNames        = {}
+
+local function getSelectedTagList()
+  local list = {}
+  for _, t in ipairs(PHONE_TAGS) do
+    if selectedTags[t.id] then
+      table.insert(list, t)
+    end
+  end
+  return list
+end
+
+local function getUnitPrice()
+  local total = PHONE_CONFIG.basePrice
+  for _, t in ipairs(getSelectedTagList()) do
+    total = total + t.price
+  end
+  return total
+end
+
+local function getTotalPrice()
+  return getUnitPrice() * orderQty
+end
+
+local function syncDepositorPrice()
+  if depositor and depositor.setTotalPrice then
+    pcall(depositor.setTotalPrice, getTotalPrice())
+  end
+end
 
 local function processIncomingStorage(data)
   if type(data) ~= "table" or not data.totals then return end
@@ -84,52 +86,7 @@ local function processIncomingStorage(data)
 end
 
 -- ==========================================
--- PAYMENT DEPOSITOR HELPERS
--- ==========================================
-local function countDepositedCurrency()
-  if not depositor then return 0 end
-  local total = 0
-  local items = depositor.list()
-  for _, stack in pairs(items) do
-    if stack.name == CURRENCY_ID then
-      total = total + stack.count
-    end
-  end
-  return total
-end
-
-local function consumeDepositedCurrency(amountNeeded)
-  if not depositor then return false end
-  if countDepositedCurrency() < amountNeeded then return false end
-
-  local remaining = amountNeeded
-  local items = depositor.list()
-  for slot, stack in pairs(items) do
-    if stack.name == CURRENCY_ID and remaining > 0 then
-      local take = math.min(stack.count, remaining)
-      -- Push to a dummy slot or drop into a void/vault chest if attached,
-      -- or pull into the shop computer's own inventory slots:
-      local moved = 0
-      for mySlot = 1, 16 do
-        if remaining <= 0 then break end
-        local space = turtle and turtle.getItemSpace(mySlot) or 64
-        local current = turtle and turtle.getItemDetail(mySlot) or nil
-        if not current or current.name == CURRENCY_ID then
-          local pushed = depositor.pushItems(peripheral.getName(depositor), slot, 0) -- no-op check
-          -- Pull directly into computer's local inventory if using a wired modem:
-          local localName = rednet.isOpen() and "top" or nil
-          moved = take
-          break
-        end
-      end
-      remaining = remaining - take
-    end
-  end
-  return remaining <= 0
-end
-
--- ==========================================
--- APPLE DESIGN UI PRIMITIVES
+-- UI PRIMITIVES & APPLE-COLORED PINEAPPLE LOGO
 -- ==========================================
 local function fillRect(x1, y1, x2, y2, bg)
   if x2 < x1 or y2 < y1 then return end
@@ -157,11 +114,7 @@ local function drawPillButton(x, y, label, bg, fg)
   return x, y, x + #label + 1, y
 end
 
--- ==========================================
--- CLASSIC APPLE-COLORED PINEAPPLE LOGO
--- ==========================================
--- Crown leaves in Green/Lime, striped body in classic Apple Rainbow:
--- Green, Yellow, Orange, Red, Magenta, Purple, Blue
+-- Green/Lime crown + classic Apple rainbow body
 local PINEAPPLE_ART = {
   { row = "    GLG    ", cols = { G = colors.green, L = colors.lime } },
   { row = "   GLLLG   ", cols = { G = colors.green, L = colors.lime } },
@@ -192,8 +145,11 @@ local function drawPineappleLogo(centerX, topY)
 end
 
 -- ==========================================
--- TOP APPLE MENU BAR
+-- TOP BAR & VIEWS
 -- ==========================================
+local hitBoxes = {}
+local btnHomeShop = {}
+
 local function drawTopBar()
   local w, _ = term.getSize()
   fillRect(1, 1, w, 1, colors.black)
@@ -210,23 +166,18 @@ local function drawTopBar()
   term.write("Home")
 
   term.setCursorPos(20, 1)
-  term.setTextColor(currentView == "store" and colors.white or colors.lightGray)
-  term.write("Store")
+  term.setTextColor(currentView == "builder" and colors.white or colors.lightGray)
+  term.write("Configure")
 
   local timeStr = textutils.formatTime(os.time(), false)
-  local statusDot = storageConnected and "*" or "o"
-  local rightStr = statusDot .. " " .. timeStr
+  local dot = storageConnected and "*" or "o"
+  local rightStr = dot .. " " .. timeStr
   term.setCursorPos(w - #rightStr, 1)
   term.setTextColor(storageConnected and colors.lime or colors.orange)
-  term.write(statusDot)
+  term.write(dot)
   term.setTextColor(colors.lightGray)
   term.write(" " .. timeStr)
 end
-
--- ==========================================
--- VIEW 1: HERO HOME SCREEN
--- ==========================================
-local btnHomeShop = {}
 
 local function drawHomeView()
   local w, h = term.getSize()
@@ -237,240 +188,142 @@ local function drawHomeView()
   drawPineappleLogo(centerX, logoTop)
 
   local textY = logoTop + #PINEAPPLE_ART + 1
-  writeCentered(textY, "Pineapple Store", colors.black, colors.white)
-  writeCentered(textY + 1, "Think Different. Build Mechanical.", colors.gray, colors.white)
+  writeCentered(textY, PHONE_CONFIG.name, colors.black, colors.white)
+  writeCentered(textY + 1, PHONE_CONFIG.tagline, colors.gray, colors.white)
 
-  local btnLabel = "Browse Products >"
-  local bx = math.max(2, math.floor((w - (#btnLabel + 2)) / 2) + 1)
+  local label = "Configure Phone >"
+  local bx = math.max(2, math.floor((w - (#label + 2)) / 2) + 1)
   local by = math.min(h - 1, textY + 3)
-  btnHomeShop = { drawPillButton(bx, by, btnLabel, colors.blue, colors.white) }
+  btnHomeShop = { drawPillButton(bx, by, label, colors.blue, colors.white) }
 end
 
--- ==========================================
--- VIEW 2: STORE CATALOG & VARIATION SELECTOR
--- ==========================================
-local hitBoxes = {}
-
-local function drawStoreView()
+local function drawBuilderView()
   local w, h = term.getSize()
   fillRect(1, 2, w, h, colors.lightGray)
   hitBoxes = {}
 
-  local leftW = math.max(18, math.floor(w * 0.44))
-  local rightX = leftW + 2
-
-  -- Left Column: Product Cards
-  fillRect(2, 3, leftW, h - 1, colors.white)
+  fillRect(2, 3, w - 1, h - 1, colors.white)
   term.setCursorPos(3, 3)
   term.setBackgroundColor(colors.white)
-  term.setTextColor(colors.gray)
-  term.write("PRODUCTS")
-
-  for idx, prod in ipairs(CATALOG) do
-    local cardY = 4 + (idx - 1) * 3
-    if cardY + 1 <= h - 1 then
-      local isSel = (idx == selectedItemIdx)
-      local cardBg = isSel and colors.blue or colors.white
-      local titleFg = isSel and colors.white or colors.black
-      local subFg   = isSel and colors.lightBlue or colors.gray
-
-      fillRect(2, cardY, leftW, cardY + 1, cardBg)
-      term.setCursorPos(3, cardY)
-      term.setTextColor(titleFg)
-      term.write(prod.name:sub(1, leftW - 3))
-
-      term.setCursorPos(3, cardY + 1)
-      term.setTextColor(subFg)
-      local minPrice = prod.variations[1].price
-      term.write(("From " .. minPrice .. " " .. CURRENCY_LABEL):sub(1, leftW - 3))
-
-      table.insert(hitBoxes, {
-        x1 = 2, y1 = cardY, x2 = leftW, y2 = cardY + 1,
-        action = "select_product", idx = idx
-      })
-    end
-  end
-
-  -- Right Column: Selected Product & Variations
-  fillRect(rightX, 3, w - 1, h - 1, colors.white)
-  local prod = CATALOG[selectedItemIdx]
-  if not prod then return end
-  local var = prod.variations[selectedVarIdx] or prod.variations[1]
-
-  term.setCursorPos(rightX + 1, 4)
-  term.setBackgroundColor(colors.white)
   term.setTextColor(colors.black)
-  term.write(prod.name:sub(1, w - rightX - 2))
+  term.write(PHONE_CONFIG.name .. " (Base: " .. PHONE_CONFIG.basePrice .. " " .. CURRENCY_LABEL .. ")")
 
-  term.setCursorPos(rightX + 1, 5)
+  term.setCursorPos(3, 4)
   term.setTextColor(colors.gray)
-  term.write(prod.tagline:sub(1, w - rightX - 2))
+  term.write("Select capability tags:")
 
-  -- Variation / Model Selector Pills
-  term.setCursorPos(rightX + 1, 7)
-  term.setTextColor(colors.black)
-  term.write("Choose Model / Variation:")
+  local ty = 6
+  for _, t in ipairs(PHONE_TAGS) do
+    if ty <= h - 5 then
+      local active = selectedTags[t.id] == true
+      local prefix = active and "[x] " or "[ ] "
+      local pillText = string.format("%s%s (+%d %s)", prefix, t.label, t.price, CURRENCY_LABEL)
+      local bg = active and t.color or colors.lightGray
+      local fg = (active and t.color == colors.yellow) and colors.black or (active and colors.white or colors.black)
 
-  local vy = 8
-  for vIdx, v in ipairs(prod.variations) do
-    if vy <= h - 6 then
-      local active = (vIdx == selectedVarIdx)
-      local bg = active and colors.black or colors.lightGray
-      local fg = active and colors.white or colors.black
-      local label = string.format("%s - %d %s", v.label, v.price, CURRENCY_LABEL)
-      local x1, y1, x2, y2 = drawPillButton(rightX + 1, vy, label:sub(1, w - rightX - 4), bg, fg)
+      local x1, y1, x2, y2 = drawPillButton(3, ty, pillText:sub(1, w - 6), bg, fg)
       table.insert(hitBoxes, {
         x1 = x1, y1 = y1, x2 = x2, y2 = y2,
-        action = "select_var", idx = vIdx
+        action = "toggle_tag", tagId = t.id
       })
-      vy = vy + 2
+      ty = ty + 2
     end
   end
 
-  -- Live Stock & Quantity Controls
-  local stock = liveTotals[var.id]
-  local stockText = storageConnected
-    and ("In Stock: " .. tostring(stock or 0))
-    or "Stock: Live Sync Standby"
-
-  local ctrlY = math.max(vy + 1, h - 4)
-  term.setCursorPos(rightX + 1, ctrlY - 1)
+  -- Stock & Quantity row
+  local ctrlY = h - 4
+  local stock = liveTotals[PHONE_CONFIG.itemId]
+  local stockStr = storageConnected and ("Stock: " .. tostring(stock or 0)) or "Stock: Standby"
+  term.setCursorPos(3, ctrlY)
   term.setBackgroundColor(colors.white)
   term.setTextColor(colors.gray)
-  term.write(stockText)
+  term.write(stockStr)
 
-  -- Quantity [-] [qty] [+]
-  local mx1, my1, mx2, my2 = drawPillButton(rightX + 1, ctrlY, "-", colors.lightGray, colors.black)
+  local mx1, my1, mx2, my2 = drawPillButton(w - 13, ctrlY, "-", colors.lightGray, colors.black)
   table.insert(hitBoxes, { x1 = mx1, y1 = my1, x2 = mx2, y2 = my2, action = "qty_minus" })
 
-  term.setCursorPos(mx2 + 2, ctrlY)
+  term.setCursorPos(w - 9, ctrlY)
   term.setBackgroundColor(colors.white)
   term.setTextColor(colors.black)
   term.write(tostring(orderQty))
 
-  local px1, py1, px2, py2 = drawPillButton(mx2 + 5, ctrlY, "+", colors.lightGray, colors.black)
+  local px1, py1, px2, py2 = drawPillButton(w - 6, ctrlY, "+", colors.lightGray, colors.black)
   table.insert(hitBoxes, { x1 = px1, y1 = py1, x2 = px2, y2 = py2, action = "qty_plus" })
 
-  -- Buy CTA Button
-  local totalCost = var.price * orderQty
-  local buyLabel = "Buy (" .. totalCost .. " " .. CURRENCY_LABEL .. ")"
-  local bx1, by1, bx2, by2 = drawPillButton(rightX + 1, h - 2, buyLabel, colors.blue, colors.white)
+  -- Checkout button
+  local totalCost = getTotalPrice()
+  local buyLabel = "Pay at Depositor (" .. totalCost .. " " .. CURRENCY_LABEL .. ")"
+  local bx1, by1, bx2, by2 = drawPillButton(3, h - 2, buyLabel:sub(1, w - 6), colors.blue, colors.white)
   table.insert(hitBoxes, { x1 = bx1, y1 = by1, x2 = bx2, y2 = by2, action = "go_checkout" })
 end
 
--- ==========================================
--- VIEW 3: DEPOSITOR CHECKOUT SCREEN
--- ==========================================
 local function drawCheckoutView()
   local w, h = term.getSize()
   fillRect(1, 2, w, h, colors.lightGray)
   hitBoxes = {}
 
-  local prod = CATALOG[selectedItemIdx]
-  local var = prod.variations[selectedVarIdx]
-  local totalCost = var.price * orderQty
-  local deposited = countDepositedCurrency()
-  local enough = (deposited >= totalCost)
+  local tags = getSelectedTagList()
+  local tagNames = {}
+  for _, t in ipairs(tags) do table.insert(tagNames, t.id) end
+  local tagSummary = (#tagNames > 0) and table.concat(tagNames, ", ") or "base-only"
 
-  local boxX1 = math.max(3, math.floor(w * 0.15))
-  local boxX2 = math.min(w - 2, math.floor(w * 0.85))
+  local totalCost = getTotalPrice()
+  syncDepositorPrice()
+
+  local boxX1 = math.max(3, math.floor(w * 0.12))
+  local boxX2 = math.min(w - 2, math.floor(w * 0.88))
   fillRect(boxX1, 3, boxX2, h - 2, colors.white)
 
-  writeCentered(4, "Checkout & Payment", colors.black, colors.white)
-  writeCentered(6, prod.name .. " - " .. var.label, colors.blue, colors.white)
-  writeCentered(7, "Quantity: " .. orderQty .. "   |   Total Due: " .. totalCost .. " " .. CURRENCY_LABEL, colors.black, colors.white)
+  writeCentered(4, "Numismatics Depositor Checkout", colors.black, colors.white)
+  writeCentered(6, string.format("%dx %s", orderQty, PHONE_CONFIG.name), colors.blue, colors.white)
+  writeCentered(7, "Tags: " .. tagSummary, colors.gray, colors.white)
+  writeCentered(8, string.format("Price: %d %s", totalCost, CURRENCY_LABEL), colors.black, colors.white)
 
-  -- Depositor Status Box
-  local depY = 9
-  fillRect(boxX1 + 2, depY, boxX2 - 2, depY + 2, colors.lightGray)
-  if not depositor then
-    writeCentered(depY + 1, "ERROR: No Payment Depositor Chest Attached!", colors.red, colors.lightGray)
-  else
-    writeCentered(depY, "Insert " .. CURRENCY_LABEL .. " into the Depositor Chest", colors.black, colors.lightGray)
-    local statusStr = string.format("Deposited: %d / %d %s", deposited, totalCost, CURRENCY_LABEL)
-    writeCentered(depY + 1, statusStr, enough and colors.green or colors.orange, colors.lightGray)
-  end
+  fillRect(boxX1 + 2, 10, boxX2 - 2, 12, colors.lightGray)
+  writeCentered(11, "Pay at Numismatics Depositor to dispense...", colors.black, colors.lightGray)
 
-  -- Action Buttons
-  local btnY = h - 4
-  local cx1, cy1, cx2, cy2 = drawPillButton(boxX1 + 3, btnY, "< Back", colors.gray, colors.white)
-  table.insert(hitBoxes, { x1 = cx1, y1 = cy1, x2 = cx2, y2 = cy2, action = "back_store" })
-
-  local payBg = (depositor and enough) and colors.green or colors.gray
-  local payLabel = enough and "Confirm & Dispense" or "Waiting for Deposit..."
-  local px1, py1, px2, py2 = drawPillButton(boxX2 - #payLabel - 4, btnY, payLabel, payBg, colors.white)
-  if depositor and enough then
-    table.insert(hitBoxes, { x1 = px1, y1 = py1, x2 = px2, y2 = py2, action = "confirm_order" })
-  end
+  local cx1, cy1, cx2, cy2 = drawPillButton(boxX1 + 3, h - 4, "< Back", colors.gray, colors.white)
+  table.insert(hitBoxes, { x1 = cx1, y1 = cy1, x2 = cx2, y2 = cy2, action = "back_builder" })
 end
 
--- ==========================================
--- VIEW 4: ORDER DISPATCHED RECEIPT
--- ==========================================
 local function drawReceiptView()
   local w, h = term.getSize()
   fillRect(1, 2, w, h, colors.white)
   hitBoxes = {}
 
-  local centerX = math.floor(w / 2)
-  drawPineappleLogo(centerX, 3)
-
-  writeCentered(14, "Order Sent to Create Fulfillment!", colors.green, colors.white)
+  drawPineappleLogo(math.floor(w / 2), 3)
+  writeCentered(14, "Payment Confirmed! Order Dispatched.", colors.green, colors.white)
   if lastOrderSummary then
     writeCentered(15, lastOrderSummary, colors.black, colors.white)
   end
-  writeCentered(16, "Collect your package at the delivery depot.", colors.gray, colors.white)
 
-  local label = "Continue Shopping"
+  local label = "Build Another"
   local bx = math.max(2, math.floor((w - (#label + 2)) / 2) + 1)
-  local x1, y1, x2, y2 = drawPillButton(bx, math.min(h - 1, 18), label, colors.blue, colors.white)
-  table.insert(hitBoxes, { x1 = x1, y1 = y1, x2 = x2, y2 = y2, action = "back_store" })
+  local x1, y1, x2, y2 = drawPillButton(bx, math.min(h - 1, 17), label, colors.blue, colors.white)
+  table.insert(hitBoxes, { x1 = x1, y1 = y1, x2 = x2, y2 = y2, action = "back_builder" })
 end
 
--- ==========================================
--- ORDER EXECUTION (CONSUME + CREATE DISPATCH)
--- ==========================================
-local function executeOrder()
-  local prod = CATALOG[selectedItemIdx]
-  local var = prod.variations[selectedVarIdx]
-  local totalCost = var.price * orderQty
-
-  if countDepositedCurrency() < totalCost then
-    return false
+local function dispatchPhoneOrder()
+  local tags = {}
+  for _, t in ipairs(getSelectedTagList()) do
+    table.insert(tags, t.id)
   end
 
-  -- Pull payment items out of the depositor into an internal vault/buffer or drop
-  -- Note: Attach a locked "vault_chest" to the wired network to store collected profits!
-  local vault = peripheral.find("minecraft:barrel")
-  local remaining = totalCost
-  for slot, stack in pairs(depositor.list()) do
-    if stack.name == CURRENCY_ID and remaining > 0 then
-      local take = math.min(stack.count, remaining)
-      if vault and peripheral.getName(vault) ~= peripheral.getName(depositor) then
-        depositor.pushItems(peripheral.getName(vault), slot, take)
-      else
-        -- Fallback: drop into rear redstone/hopper if no separate vault peripheral
-        depositor.pushItems("bottom", slot, take)
-      end
-      remaining = remaining - take
-    end
-  end
-
-  -- Broadcast order to Create fulfillment controller
-  local orderPayload = {
+  local payload = {
     action  = "dispense_order",
-    product = prod.name,
-    variant = var.label,
-    item    = var.id,
-    channel = var.channel,
+    product = PHONE_CONFIG.name,
+    item    = PHONE_CONFIG.itemId,
+    channel = PHONE_CONFIG.channel,
+    tags    = tags,
     qty     = orderQty,
-    paid    = totalCost
+    paid    = getTotalPrice()
   }
-  rednet.broadcast(orderPayload, ORDER_PROTOCOL)
+  rednet.broadcast(payload, ORDER_PROTOCOL)
 
-  lastOrderSummary = string.format("%dx %s (%s)", orderQty, prod.name, var.label)
+  local tagStr = (#tags > 0) and (" [" .. table.concat(tags, ", ") .. "]") or ""
+  lastOrderSummary = string.format("%dx %s%s", orderQty, PHONE_CONFIG.name, tagStr)
   orderQty = 1
-  return true
+  currentView = "receipt"
 end
 
 -- ==========================================
@@ -480,8 +333,8 @@ local function render()
   drawTopBar()
   if currentView == "home" then
     drawHomeView()
-  elseif currentView == "store" then
-    drawStoreView()
+  elseif currentView == "builder" then
+    drawBuilderView()
   elseif currentView == "checkout" then
     drawCheckoutView()
   elseif currentView == "receipt" then
@@ -490,15 +343,23 @@ local function render()
 end
 
 render()
-local refreshTimer = os.startTimer(1)
+local clockTimer = os.startTimer(5)
+local prevRedstone = redstone.getInput(DEPOSITOR_REDSTONE_SIDE)
 
 while true do
   local event, p1, p2, p3 = os.pullEvent()
 
-  if event == "timer" and p1 == refreshTimer then
-    -- Refresh clock & live depositor count during checkout
+  if event == "timer" and p1 == clockTimer then
     render()
-    refreshTimer = os.startTimer(1)
+    clockTimer = os.startTimer(5)
+
+  elseif event == "redstone" and currentView == "checkout" then
+    local nowRedstone = redstone.getInput(DEPOSITOR_REDSTONE_SIDE)
+    if nowRedstone and not prevRedstone then
+      dispatchPhoneOrder()
+      render()
+    end
+    prevRedstone = nowRedstone
 
   elseif event == "rednet_message" and p3 == STORAGE_PROTOCOL then
     processIncomingStorage(p2)
@@ -507,43 +368,41 @@ while true do
   elseif event == "monitor_touch" then
     local x, y = p2, p3
 
-    -- Top Menu Bar Navigation
     if y == 1 then
       if x >= 2 and x <= 18 then
         currentView = "home"
         render()
-      elseif x >= 20 and x <= 26 then
-        currentView = "store"
+      elseif x >= 20 and x <= 28 then
+        currentView = "builder"
+        syncDepositorPrice()
         render()
       end
 
     elseif currentView == "home" then
       if #btnHomeShop == 4 and x >= btnHomeShop[1] and x <= btnHomeShop[3] and y == btnHomeShop[2] then
-        currentView = "store"
+        currentView = "builder"
+        syncDepositorPrice()
         render()
       end
 
     else
       for _, hb in ipairs(hitBoxes) do
         if x >= hb.x1 and x <= hb.x2 and y >= hb.y1 and y <= hb.y2 then
-          if hb.action == "select_product" then
-            selectedItemIdx = hb.idx
-            selectedVarIdx = 1
-            orderQty = 1
-          elseif hb.action == "select_var" then
-            selectedVarIdx = hb.idx
+          if hb.action == "toggle_tag" then
+            selectedTags[hb.tagId] = not selectedTags[hb.tagId]
+            syncDepositorPrice()
           elseif hb.action == "qty_minus" then
             orderQty = math.max(1, orderQty - 1)
+            syncDepositorPrice()
           elseif hb.action == "qty_plus" then
             orderQty = math.min(64, orderQty + 1)
+            syncDepositorPrice()
           elseif hb.action == "go_checkout" then
             currentView = "checkout"
-          elseif hb.action == "back_store" then
-            currentView = "store"
-          elseif hb.action == "confirm_order" then
-            if executeOrder() then
-              currentView = "receipt"
-            end
+            syncDepositorPrice()
+          elseif hb.action == "back_builder" then
+            currentView = "builder"
+            syncDepositorPrice()
           end
           render()
           break
