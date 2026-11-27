@@ -1,16 +1,14 @@
 -- ==========================================
--- PINEAPPLE STORE: VAULT ORDER RECEIVER
+-- PINEAPPLE STORE: LOGISTICS NETWORK ORDER RECEIVER
 -- ==========================================
 peripheral.find("modem", rednet.open)
 assert(rednet.isOpen(), "No wireless/wired modem attached!")
 
 local ORDER_PROTOCOL = "pineapple_order"
 
--- Optional: set exact peripheral name of your delivery chest/barrel/hopper,
--- or leave nil to automatically use the first inventory that isn't a vault
-local DELIVERY_INVENTORY_NAME = nil
+-- Address on your destination Bee Port / Frogport
+local BEE_PORT_ADDRESS = "PineapplePickup"
 
--- Map capability tags to item IDs stored in your vaults (nil = software-only tag)
 local TAG_ITEMS = {
   ["data-plan"] = "computercraft:disk",
   ["wireless"]  = "computercraft:wireless_modem_normal",
@@ -19,58 +17,51 @@ local TAG_ITEMS = {
   ["developer"] = "minecraft:redstone"
 }
 
-local function getAllInventories()
-  return { peripheral.find("inventory") }
+local function findStockTicker()
+  return peripheral.find("Create_StockTicker")
+    or peripheral.find("create:stock_ticker")
+    or peripheral.find("stock_ticker")
 end
 
-local function isVaultName(name)
-  return name:find("vault") ~= nil
-end
+local function sendNetworkOrder(address, countsById)
+  local ticker = findStockTicker()
+  local filters = {}
 
-local function findDeliveryTarget(allInvs)
-  if DELIVERY_INVENTORY_NAME then
-    return DELIVERY_INVENTORY_NAME
+  for id, count in pairs(countsById) do
+    table.insert(filters, {
+      name  = id,
+      count = count
+    })
   end
-  for _, inv in ipairs(allInvs) do
-    local name = peripheral.getName(inv)
-    if not isVaultName(name) then
-      return name
+
+  if #filters == 0 then
+    return false, "No items in order"
+  end
+
+  -- 1. Stock Ticker: requestFiltered(address, filter1, filter2, ...)
+  if ticker and ticker.requestFiltered then
+    local ok, err = pcall(ticker.requestFiltered, address, table.unpack(filters))
+    return ok, err
+  end
+
+  -- 2. Fallback: Redstone Requester if attached instead of Stock Ticker
+  local requester = peripheral.find("create:redstone_requester")
+    or peripheral.find("redstone_requester")
+  if requester and requester.request then
+    if requester.setAddress then
+      pcall(requester.setAddress, address)
     end
-  end
-  return nil
-end
-
-local function pullFromVaults(itemId, neededCount, allInvs, destName)
-  local remaining = neededCount
-  if not destName or not itemId or remaining <= 0 then
-    return 0, remaining
+    local ok, err = pcall(requester.request)
+    return ok, err
   end
 
-  for _, inv in ipairs(allInvs) do
-    local invName = peripheral.getName(inv)
-    if isVaultName(invName) and invName ~= destName then
-      local ok, list = pcall(inv.list)
-      if ok and type(list) == "table" then
-        for slot, stack in pairs(list) do
-          if remaining <= 0 then break end
-          if stack.name == itemId then
-            local toMove = math.min(stack.count, remaining)
-            local moved = inv.pushItems(destName, slot, toMove) or 0
-            remaining = remaining - moved
-          end
-        end
-      end
-    end
-    if remaining <= 0 then break end
-  end
-
-  local dispensed = neededCount - remaining
-  return dispensed, remaining
+  return false, "No Stock Ticker or Redstone Requester peripheral found"
 end
 
 term.clear()
 term.setCursorPos(1, 1)
-print("=== Pineapple Vault Order Receiver ===")
+print("=== Pineapple Network Order Receiver ===")
+print("Bee Port Address: " .. BEE_PORT_ADDRESS)
 print("Listening on: " .. ORDER_PROTOCOL .. "\n")
 
 while true do
@@ -79,35 +70,30 @@ while true do
   if type(msg) == "table" and msg.action == "dispense_order" then
     local qty  = tonumber(msg.qty) or 1
     local tags = msg.tags or {}
-    local allInvs = getAllInventories()
-    local destName = findDeliveryTarget(allInvs)
 
-    print(string.format("[Order #%d] %dx %s", senderId, qty, msg.product or "Pineapple Phone"))
-    if not destName then
-      print("  [ERR] No delivery chest/barrel found on network! Set DELIVERY_INVENTORY_NAME.\n")
+    local countsById = {}
+    local function addItem(id, n)
+      if id and n > 0 then
+        countsById[id] = (countsById[id] or 0) + n
+      end
+    end
+
+    -- Base Pineapple Phone
+    addItem(msg.item or "computercraft:pocket_computer_advanced", qty)
+
+    -- Selected capability tag items
+    for _, tagId in ipairs(tags) do
+      addItem(TAG_ITEMS[tagId], qty)
+    end
+
+    print(string.format("[Order #%d] Ordering %dx %s -> '%s'",
+      senderId, qty, msg.product or "Pineapple Phone", BEE_PORT_ADDRESS))
+
+    local ok, err = sendNetworkOrder(BEE_PORT_ADDRESS, countsById)
+    if ok then
+      print("  [OK] Network package order placed!\n")
     else
-      -- 1. Dispense base phone(s) from vaults
-      local phoneId = msg.item or "computercraft:pocket_computer_advanced"
-      local gotPhone, missPhone = pullFromVaults(phoneId, qty, allInvs, destName)
-      print(string.format("  Phone (%s): %d/%d -> %s", phoneId, gotPhone, qty, destName))
-      if missPhone > 0 then
-        print("    [WARN] Short by " .. missPhone .. " in vaults")
-      end
-
-      -- 2. Dispense tag items from vaults
-      for _, tagId in ipairs(tags) do
-        local tagItemId = TAG_ITEMS[tagId]
-        if tagItemId then
-          local gotTag, missTag = pullFromVaults(tagItemId, qty, allInvs, destName)
-          print(string.format("  Tag [%s] (%s): %d/%d", tagId, tagItemId, gotTag, qty))
-          if missTag > 0 then
-            print("    [WARN] Short by " .. missTag .. " in vaults")
-          end
-        else
-          print("  Tag [" .. tagId .. "] (software tag)")
-        end
-      end
-      print("  [DONE]\n")
+      print("  [ERR] " .. tostring(err) .. "\n")
     end
   end
 end
